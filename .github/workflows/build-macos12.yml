@@ -108,7 +108,7 @@ jobs:
 
           archive="zig-macos-x86_64-${ZIG_VERSION}.tar.xz"
           curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/${archive" \
+            "https://ziglang.org/download/${ZIG_VERSION}/${archive}" \
             --output "$RUNNER_TEMP/$archive"
           tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-macos-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
