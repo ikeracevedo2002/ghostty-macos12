@@ -1,0 +1,197 @@
+name: Build latest macOS 12-compatible tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (leave empty to use the latest v*-macos-12 tag)"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*-macos-12"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-macos12-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Ghostty for macOS 12
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Select source tag
+        id: source
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ref="${REQUESTED_TAG:-}"
+
+          if [[ -z "$ref" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            ref="$GITHUB_REF_NAME"
+          fi
+
+          if [[ -z "$ref" ]]; then
+            ref="$(git tag --list 'v*-macos-12' --sort=-version:refname | head -n 1)"
+          fi
+
+          if [[ -z "$ref" ]]; then
+            ref="${GITHUB_REF_NAME:-macos-12}"
+            echo "::warning::No v*-macos-12 tag exists in this repository; building $ref instead."
+          fi
+
+          if [[ "$ref" == v* ]]; then
+            if ! git rev-parse --verify --quiet "refs/tags/$ref" >/dev/null; then
+              echo "::error::Tag $ref does not exist in this repository."
+              exit 1
+            fi
+            git checkout --detach "$ref"
+          elif [[ "$ref" == "macos-12" ]]; then
+            git checkout --detach "$ref"
+          else
+            echo "::error::Only a Git tag or the macos-12 branch can be selected."
+            exit 1
+          fi
+
+          source_version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon | head -n 1)"
+          zig_version="$(sed -n 's/.*requireZig("\([^"]*\)").*/\1/p' build.zig | head -n 1)"
+
+          if [[ -z "$source_version" || -z "$zig_version" ]]; then
+            echo "::error::Could not determine Ghostty or Zig version from the checked-out source."
+            exit 1
+          fi
+
+          if [[ "$ref" == v* ]]; then
+            tag_version="${ref#v}"
+            tag_version="${tag_version%-macos-12}"
+            if [[ "$tag_version" != "$source_version" ]]; then
+              echo "::error::Tag $ref contains version $tag_version, but build.zig.zon declares $source_version."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "version=$source_version"
+            echo "zig_version=$zig_version"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Building $ref (Ghostty $source_version) with Zig $zig_version"
+
+      - name: Install Zig
+        shell: bash
+        env:
+          ZIG_VERSION: ${{ steps.source.outputs.zig_version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "::error::This workflow requires an Intel macOS runner."
+            exit 1
+          fi
+
+          archive="zig-macos-x86_64-${ZIG_VERSION}.tar.xz"
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/${archive" \
+            --output "$RUNNER_TEMP/$archive"
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-macos-x86_64-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Build GhosttyKit
+        env:
+          GHOSTTY_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Dversion-string="$GHOSTTY_VERSION" \
+            -Demit-docs=false
+
+      - name: Build Ghostty.app
+        env:
+          DERIVED_DATA_PATH: ${{ runner.temp }}/ghostty-derived-data
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project macos/Ghostty.xcodeproj \
+            -target Ghostty \
+            -configuration Release \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -arch x86_64 \
+            MACOSX_DEPLOYMENT_TARGET=12.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=-
+
+      - name: Package and verify artifact
+        id: package
+        env:
+          DERIVED_DATA_PATH: ${{ runner.temp }}/ghostty-derived-data
+          GHOSTTY_VERSION: ${{ steps.source.outputs.version }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          app="$DERIVED_DATA_PATH/Build/Products/Release/Ghostty.app"
+          if [[ ! -d "$app" ]]; then
+            echo "::error::Ghostty.app was not produced at $app"
+            find "$DERIVED_DATA_PATH" -name Ghostty.app -type d -print
+            exit 1
+          fi
+
+          binary="$app/Contents/MacOS/ghostty"
+          file "$binary"
+          otool -l "$binary" | grep -A 5 LC_BUILD_VERSION || true
+
+          if ! file "$binary" | grep -q "x86_64"; then
+            echo "::error::The application is not an Intel x86_64 build."
+            exit 1
+          fi
+
+          mkdir -p dist
+          zip_name="Ghostty-${GHOSTTY_VERSION}-macos12-x86_64.zip"
+          dmg_name="Ghostty-${GHOSTTY_VERSION}-macos12-x86_64.dmg"
+
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/$zip_name"
+          hdiutil create \
+            -volname "Ghostty ${GHOSTTY_VERSION}" \
+            -srcfolder "$app" \
+            -ov \
+            -format UDZO \
+            "dist/$dmg_name"
+
+          cat > dist/BUILD_INFO.txt <<EOF
+          source_ref=${SOURCE_REF}
+          ghostty_version=${GHOSTTY_VERSION}
+          macos_deployment_target=${MACOSX_DEPLOYMENT_TARGET}
+          architecture=x86_64
+          signed=false
+          EOF
+
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=$dmg_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS 12 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostty-macos12-${{ steps.source.outputs.version }}-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
